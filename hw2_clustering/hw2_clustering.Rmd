@@ -1,0 +1,147 @@
+---
+title: "Homework 2. Clustering"
+author: "Mike"
+date: '29 марта 2017 г '
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(DESeq2)
+library(ggplot2)
+library(pheatmap)
+library(amap)
+library(dbscan)
+options(width=120)
+```
+
+# Intro
+Чаще всего при работе с данными экспрессии используется две кластеризации: иерархическая кластеризация в пространстве образцов и K-means в пространстве генов.
+
+Первая нужна для того, чтобы понимать как ваши образцы соотносятся с дизайном эксперимента, который у вас есть, а также для поиска аутлаеров в вашем эксперименте (ведь если есть образцы, которые совсем не похожи на другие, должно быть, это аутлаеры? Или нет?).
+
+Вторая нужна для описания паттернов экспрессии в ваших образцах + приятнее рисовать хитмапы, когда гены идут не как попало, а упорядочены в кластеры.
+
+В обоих случаях, мы будем использовать корреляцию (между образцами и между генами) как меру похожести для нашей кластеризации. И соотвественно 1 - cor(x, y) – как меру “непохожести”.
+
+Также в обоих случаях, мы сначала оставим только 8000 самых сильно эспрессированных генов. Это делается за тем, что мало экспрессированные гены привносят шум в “паттерны” экспрессии, а так же невольно завышают корреляцию между образцами: ведь они слабо экспрессированы во всех образцах.
+
+# Hierarchical clustering
+Возьмем весь датасет с аутлаером
+```{r read_data, cache=TRUE, message=FALSE}
+counts <- read.csv("../data/GSE89225_Illumina_counts.csv", row.names=1)
+conditions <- read.csv("../data/conditions.csv", row.names=1)
+```
+
+Создадим DeseqDataSet объект (дизайн не важен)
+```{r dds, cache=TRUE, message=FALSE}
+dds <- DESeqDataSetFromMatrix(countData = counts,
+                              colData = conditions,
+                              design = ~ tissue + cells)
+```
+
+Оставим только 8000 экспрессированых генов
+```{r top8000, cache=TRUE, message=FALSE}
+dds <- dds[order(rowSums(counts(dds)), decreasing = T), ][1:8000, ]
+dds <- DESeq(dds)
+vst_dds <- vst(dds)
+counts.norm <- assay(vst_dds)
+```
+
+Используем rlog(dds) для получения логарифмированных значений экспрессии
+```{r log_dds, cache=TRUE, message=FALSE}
+log_dds <- rlog(dds)
+counts.log <- assay(log_dds)
+```
+
+Посчитаем корреляции между образцами используя cor (результатом будет матрица размера m×m, где m – количество образцов)
+```{r cor_log_dds}
+cor_log_dds <- cor(counts.log)
+```
+
+Посчитаем матрицу “непохожести” 1 - cor, и dist объект для этой матрицы
+```{r cor_log_dds_rev}
+cor_log_dds_rev <- 1 - cor_log_dds
+dist_cor_rev <- dist(cor_log_dds_rev)
+```
+
+Сделаем кластеризацию с помощью функции hclust, используя три разных метода “связывания” объектов в группы: average, complete and single
+Построим для каждой график с помощью plot
+```{r hclust, message=FALSE}
+ms <- c("average", "complete", "single")
+lapply(ms, function(m) plot(hclust(dist_cor_rev, m)))
+```
+
+
+# K-means
+Возьмем весь датасет без аутлаера
+```{r remove_outlier, cache=TRUE, message=FALSE}
+counts <- counts[, colnames(counts) != "treg_NBP_patient3"]
+conditions <- conditions[rownames(conditions) != "treg_NBP_patient3", ]
+```
+
+Создадим DeseqDataSet объект (дизайн не важен)
+```{r dds_2, cache=TRUE, message=FALSE}
+dds <- DESeqDataSetFromMatrix(countData = counts,
+                              colData = conditions,
+                              design = ~ tissue + cells)
+```
+
+Оставим только 8000 экспрессированых генов
+```{r top8000_2, cache=TRUE, message=FALSE}
+dds <- dds[order(rowSums(counts(dds)), decreasing = T), ][1:8000, ]
+dds <- DESeq(dds)
+vst_dds <- vst(dds)
+counts.norm <- assay(vst_dds)
+```
+
+Используем rlog(dds) для получения логарифмированных значений экспрессии
+```{r log_dds_2}
+log_dds <- rlog(dds)
+counts.log <- assay(log_dds)
+```
+
+
+Используем функцию Kmeans из пакета amap с методом “correlation”, c количеством кластеров равным 6. (Вы можете выбрать своё количество кластеров), и максимальным количеством итераций равным 20000
+```{r kmeans}
+kms <- Kmeans(counts.log, method = "correlation", iter.max = 20000, centers = 6)
+```
+
+После этого вы можете достать соотвествие каждого гена кластеру с помощью элемента листа с названием “cluster”
+```{r clusters}
+head(kms$cluster)
+```
+
+После этого от вас потребуется эту кластеризацию изобразить на хитмапе: гены должны быть отсортированы по кластерам, а столбцы сначала по клеткам, а затем по тканям.
+```{r heatmap}
+to_visualise <- counts.log[order(kms$cluster), order(conditions$cells, conditions$tissue)]
+to_visualise <- t(apply(to_visualise, 1, function(r) {
+  (r - min(r)) / (max(r) - min(r))
+}))
+
+pheatmap(to_visualise, 
+         show_rownames = F, cluster_rows = F,
+         cluster_cols=F,
+         annotation_col = conditions,
+         annotation_row = data.frame(cluster = as.factor(kms$cluster)))
+```
+
+
+# Density based algortihms
+Есть алгоритмы, которые позволяют находить “плотные” кластеры, и при этом им не нужно указывать число кластеров. Пример такого алгоритма (DBSCAN) был на журнальном клубе посвящённому single-cell RNA-seq. В этом задании от вас потребуется запустить DBSCAN и подобрать к нему аргументы так, чтобы картинка была похожа на что-нибудь разумное.
+
+В архиве находится файлик projection.csv, который содержит в себе результаты анализа данных single-cell RNA-seq, а именно tSNE-проекции всех клеток. По сути каждая клетка здесь определена в двух-мерном пространстве, и клетки транскрипционные профили которых бризки друг к другу находятся на этой проекции близко, а те, что транскрипционно различаются – находятся дальше.
+
+Базовая концепция алгоритма DBSCAN очень простая – для каждой точки, мы можем посмотреть количество точек-соседей, которые находятся к ней ближе чем на какое-то расстояние ϵϵ. Если количество точек, в этой ϵϵ-окрестности больше или равно заранее определенного числа kk, и какие-то из этих точек-соседей уже лежат в кластере – то нашу точку можно в этот кластер добавить.
+
+Пакет dbscan доступен из CRAN, функция dbscan принимает, кроме объекта с точками в пространстве, два аргумента: радиус окружности вокруг точки ϵϵ, в которой мы пытаемся найти достаточноe число соседей, и достаточно число соседей kk в этой окружности.
+
+Ознакомиться с пакетом можно тут: https://cran.r-project.org/web/packages/dbscan/vignettes/dbscan.pdf , там же можно ознакомиться и с работой алгоритма и базовой простой концепцией.
+
+```{r dbscan}
+projection <- read.csv("../data/projection.csv", stringsAsFactors = F)[, c(2,3)]
+clustering <- dbscan(projection, eps = 3, minPts = 5)
+projection$cluster <- as.factor(clustering$cluster)
+
+ggplot(projection, aes(x = TSNE.1, y = TSNE.2, col = cluster))+
+  geom_point()
+```
