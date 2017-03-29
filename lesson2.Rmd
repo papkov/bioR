@@ -233,8 +233,8 @@ pheatmap(to_visualise2,
 Общие дифферениально экспрессированные гены у сравнений
 ``` {r venn}
 
-set_cells <- rownames(res)[res$padj < 0.01]
-set_tissue <- rownames(res2)[res2$padj < 0.01]
+set_cells <- rownames(res)[replace(res$padj < 0.01, is.na(res$padj < 0.01), F)]
+set_tissue <- rownames(res2)[replace(res2$padj < 0.01, is.na(res2$padj < 0.01), F)]
 common_genes <- intersect(set_cells, set_tissue)
 draw.pairwise.venn(length(set_cells), length(set_tissue), length(common_genes),
                    category = c("Treg vs Tconv", "Tumor tissue vs normal tissue"),
