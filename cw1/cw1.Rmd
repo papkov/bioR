@@ -1,0 +1,247 @@
+---
+title: "Контрольная работа 1"
+subtitle: "Three distinct cell populations express extracellular matrix proteins and increase in number during skeletal muscle fibrosis"
+author: "Михаил Папков"
+date: '8 апреля 2017 г '
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(DESeq2)
+library(ggplot2)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(pheatmap)
+library(dplyr)
+library(VennDiagram)
+library(amap)
+library(dbscan)
+options(width=120)
+```
+# Описание и подготовка данных
+
+Предложен датасет RNA-seq 2017 года из статьи ”Three distinct cell populations express extracellular matrix proteins and increase in number during skeletal muscle fibrosis”. Статья о том, что важно понимать какие клетки производят компоненты внеклеточного матрикса; в поперечнополосатой мышце нахождение таких клеток важно в контексте заболеваний, где изменения внеклеточного матрикса могут вызывать фиброз и последующую повышенную жесткость тканей и их дисфункцию. 
+Примечательного в статье то, что ребята сначала нашли те клетки, которые производят компоненты внеклеточного матрикса, а затем научились эти клетки изолировать и показали, что их три разных подтипа: fibroblasts (FB), fibro / adipogenic progenitors (FAP), skeletal muscle progenitor (SMP). После чего они взяли два вида мышей: the nesprin-desmin double knockout (DKO) mouse и wild-type (WT) mouse, отсортировали из них эти клетки и сделали RNA-seq.
+
+Описание этих образцов находится в файле GSE89633_conditions.tsv, а сами данные экспрессии после выравнивания ридов на индексный геном находятся в файле GSE89633_counts.tsv
+
+Прочитаем файлы:
+```{r files}
+counts <- read.csv("../data/GSE89633_counts.tsv", sep = "\t", row.names = 1)
+conditions <- read.csv("../data/GSE89633_conditions.tsv", sep = "\t", row.names = 1)
+
+print(counts[1:6, 1:2])
+dim(counts)
+
+head(conditions)
+dim(conditions)
+```
+
+### DESeq2
+DESeq2 -- это царь-библиотека необходимая для работы с данными RNA-seq. Тут и дифференциальная экспрессия, и нормализации, и PCA-plots.
+
+Подготовим dds для всех данных
+```{r deseq_prep, cache=TRUE, message=FALSE}
+dds <- DESeqDataSetFromMatrix(countData = counts,
+                              colData = conditions,
+                              design = ~ cells + conditions)
+dds <- dds[rowSums(counts(dds)) > 20, ]
+dds <- DESeq(dds)
+vst_dds <- vst(dds)
+counts.norm <- assay(vst_dds)
+```
+
+# Исследование
+## 1. Visual quality control and self-consistance
+### 1.1 PCA
+Строим PCA-plot на всех генах датасета
+```{r PCA}
+pca_data <- prcomp(t(counts.norm))
+percents <- pca_data$sdev^2 / sum(pca_data$sdev^2)
+to_plot <- t(counts.norm) %*% pca_data$rotation
+
+gdata <- data.frame(
+  x=to_plot[, 1],
+  y=to_plot[, 2],
+  tissue=conditions[, 1],
+  cells=conditions[, 2],
+  name=rownames(conditions)
+)
+
+ggplot(data=gdata, aes(x=x, y=y, color=cells, shape=tissue, label=name)) +
+  geom_point(size=3) + theme_bw()  +
+  xlab(paste0("PC", 1, ": ", formatC(100 * percents[1], digits=4), "%")) +
+  ylab(paste0("PC", 2, ": ", formatC(100 * percents[2], digits=4), "%")) +
+  geom_text(size=2, check_overlap = T, position = position_jitter())
+
+plotPCA(vst_dds, intgroup=c("conditions", "cells")) + theme_bw()
+```
+
+### 1.2 Кластеризация
+Взять 8000 самых экспрессированных генов (по средней экспрессии во всех сэмплах), кластеризовать эти гены используя функцию Kmeans из пакета amap (возьмите число кластеров, которое вам нравится от 8 до 12), и построить heatmap, как в домашней работе по кластеризации.
+
+```{r top8000, cache=TRUE, message=FALSE}
+dds_8000 <- dds[order(rowSums(counts(dds)), decreasing = T), ][1:8000, ]
+dds_8000 <- DESeq(dds_8000)
+vst_dds_8000 <- vst(dds_8000)
+counts.norm_8000 <- assay(vst_dds_8000)
+```
+
+Используем rlog(dds) для получения логарифмированных значений экспрессии
+```{r log_dds_2, message=FALSE}
+log_dds_8000 <- rlog(dds_8000)
+counts.log_8000 <- assay(log_dds_8000)
+```
+
+Используем функцию Kmeans из пакета amap с методом “correlation”, c количеством кластеров равным от 8 до 12, и максимальным количеством итераций равным 20000
+```{r kmeans}
+kms <- Kmeans(counts.log_8000, method = "correlation", iter.max = 20000, centers = 8)
+```
+
+После этого вы можете достать соотвествие каждого гена кластеру с помощью элемента листа с названием “cluster”
+```{r clusters}
+head(kms$cluster)
+```
+
+После этого от вас потребуется эту кластеризацию изобразить на хитмапе: гены должны быть отсортированы по кластерам, а столбцы сначала по клеткам, а затем по тканям.
+```{r heatmap}
+to_visualise <- counts.log_8000[order(kms$cluster), order(conditions$conditions, conditions$cells)]
+to_visualise <- t(apply(to_visualise, 1, function(r) {
+  (r - min(r)) / (max(r) - min(r))
+}))
+
+pheatmap(to_visualise, 
+         show_rownames = F, cluster_rows = F,
+         cluster_cols=F,
+         annotation_col = conditions,
+         annotation_row = data.frame(cluster = as.factor(kms$cluster)))
+```
+
+**Q: Можем ли мы судя по PCA plot и heatmap сказать, что в этом датасете есть явные аутлаеры?**
+
+A: Явных аутлаеров не видно 
+
+**Q: Можем ли мы предположить по PCA plot, чем объяснена большая часть вариации в наших данных?**
+
+A: Кажется, что наибольшая часть вариации объясняется типом клеток
+
+
+## 2. Differential expression
+
+Поделим данные на 3 группы сравнения:
+1. FB WT vs FB DKO
+2. FAP WT vs FAP DKO
+3. SMP WT vs SMP DKO
+```{r split_data}
+conditions_fb <- conditions[conditions$cells == "cell type: FB", ]
+conditions_fap <- conditions[conditions$cells == "cell type: FAP", ]
+conditions_smp <- conditions[conditions$cells == "cell type: SMP", ]
+
+counts_fb <- counts[colnames(counts) %in% rownames(conditions_fb)]
+counts_fap <- counts[colnames(counts) %in% rownames(conditions_fap)]
+counts_smp <- counts[colnames(counts) %in% rownames(conditions_smp)]
+```
+
+Для каждой группы подготовим dds
+```{r diff_deseq, cache=TRUE, message=FALSE}
+dds_fb <- DESeqDataSetFromMatrix(countData = counts_fb,
+                              colData = conditions_fb,
+                              design = ~ conditions)
+dds_fb <- dds_fb[rowSums(counts(dds_fb)) > 20, ]
+dds_fb <- DESeq(dds_fb)
+vst_dds_fb <- vst(dds_fb)
+counts.norm_fb <- assay(vst_dds_fb)
+
+dds_fap <- DESeqDataSetFromMatrix(countData = counts_fap,
+                              colData = conditions_fap,
+                              design = ~ conditions)
+dds_fap <- dds_fap[rowSums(counts(dds_fap)) > 20, ]
+dds_fap <- DESeq(dds_fap)
+vst_dds_fap <- vst(dds_fap)
+counts.norm_fap <- assay(vst_dds_fap)
+
+dds_smp <- DESeqDataSetFromMatrix(countData = counts_smp,
+                              colData = conditions_smp,
+                              design = ~ conditions)
+dds_smp <- dds_smp[rowSums(counts(dds_smp)) > 20, ]
+dds_smp <- DESeq(dds_smp)
+vst_dds_smp <- vst(dds_smp)
+counts.norm_smp <- assay(vst_dds_smp)
+```
+
+Получим данные дифференциальной экспрессии
+```{r diff_exp}
+res_fb <- results(dds_fb)
+mcols(res_fb)$description
+res_fb <- res_fb[order(res_fb[, 4]), ]
+res_fb
+
+res_fap <- results(dds_fap)
+mcols(res_fap)$description
+res_fap <- res_fap[order(res_fap[, 4]), ]
+res_fap
+
+res_smp <- results(dds_smp)
+mcols(res_smp)$description
+res_smp <- res_smp[order(res_smp[, 4]), ]
+res_smp
+
+```
+
+
+Самый обычный способ визуализировать данные дифф.экспрессии -- это volcano plot. По оси x мы будем откладывать log fold change, а по y - adjusted p value.
+```{r volcano_plot}
+threshold <- 0.01
+
+gdata_fb <- data.frame(
+  type = "FB WT vs FB DKO",
+  x = res_fb$log2FoldChange,
+  y = -log10(res_fb$padj),
+  significant = res_fb$padj < threshold)
+
+gdata_fap <- data.frame(
+  type = "FAP WT vs FAP DKO",
+  x = res_fap$log2FoldChange,
+  y = -log10(res_fap$padj),
+  significant = res_fap$padj < threshold)
+
+gdata_smp <- data.frame(
+  type = "SMP WT vs SMP DKO",
+  x = res_smp$log2FoldChange,
+  y = -log10(res_smp$padj),
+  significant = res_smp$padj < threshold)
+
+
+gdata <- na.omit(rbind(gdata_fb, gdata_fap, gdata_smp))
+
+ggplot(data=gdata, aes(x=x, y=y, color=significant)) +
+  facet_grid(.~type)+
+  geom_point(size=1) + theme_bw()  +
+  xlab("Log fold change") +
+  ylab("Adjusted p.value") +
+  scale_color_manual(values = c("black", "red"))+
+  geom_hline(yintercept=-log10(threshold), linetype=2, size=1, colour = "Red")
+```
+
+### Venn diagram
+Общие дифферениально экспрессированные гены у сравнений
+``` {r venn, message=FALSE}
+
+set_fb <- rownames(res_fb)[replace(res_fb$padj < 0.01, is.na(res_fb$padj < 0.01), F)]
+set_fap <- rownames(res_fap)[replace(res_fap$padj < 0.01, is.na(res_fap$padj < 0.01), F)]
+set_smp <- rownames(res_smp)[replace(res_smp$padj < 0.01, is.na(res_smp$padj < 0.01), F)]
+
+common_fb_fap <- intersect(set_fb, set_fap)
+common_fb_smp <- intersect(set_fb, set_smp)
+common_fap_smp <- intersect(set_fap, set_smp)
+common_all <- intersect(common_fap_smp, set_fb)
+
+draw.triple.venn(length(set_fb), length(set_fap), length(set_smp), 
+                 length(common_fb_fap), length(common_fap_smp), length(common_fb_smp), length(common_all),
+                 category = c("FB", "FAP", "SMP"),
+                 fill = c("blue", "red", "green"), alpha = c(0.5, 0.5, 0.5), lty = "blank")
+```
+
+**Q: Можем ли мы по volcano plot предположить, транксрипционное состояние каких типов клеток изменилось сильнее/слабее после двойного нокаута?**
+
+A: FB сильнее, SMP слабее
