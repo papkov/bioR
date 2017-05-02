@@ -1,0 +1,152 @@
+---
+title: "hw_sql"
+author: "Mike"
+date: '2 мая 2017 г '
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Библиотеки
+```{r libs, warning=F, message=F}
+library(RSQLite)
+library(DBI)
+```
+
+## Соединение
+```{r setdb, warning=FALSE, message=F}
+mydb <- dbConnect(RSQLite::SQLite(), "../data/data.sqlite")
+dbListTables(mydb)
+```
+
+####1. Перечислить пользователей в алфавитном порядке username (все колонки в любом порядке)
+```{r c1}
+head(dbGetQuery(mydb, "SELECT * FROM Users ORDER BY username;"))
+```
+
+####2. 5 пользователей, которые зарегистрировались последними (все колонки в любом порядке)
+```{r c2}
+dbGetQuery(mydb, "SELECT * FROM Users ORDER BY registered DESC LIMIT 5;")
+```
+
+####3. Топ 5 пользователей по числу прослушиваний (все колонки в любом порядке)
+```{r c3}
+dbGetQuery(mydb, "SELECT username, count(DISTINCT song_id) AS listenings 
+           FROM Listened JOIN Users ON Users.id = Listened.user_id
+           GROUP BY user_id
+           ORDER BY listenings DESC
+           LIMIT 5;")
+```
+
+####4. Информацию об исполнителях и количестве их альбомов (имя исполнителя|число)
+```{r c4}
+head(dbGetQuery(mydb, "SELECT Artists.name, count(Albums.id) AS albums 
+           FROM Artists INNER JOIN Albums ON Artists.id = Albums.artist_id 
+           GROUP BY Artists.id"))
+```
+
+####5. Информацию об исполнителях и количестве их песен (имя исполнителя|число)
+```{r c5}
+head(dbGetQuery(mydb, "SELECT Artists.name AS artist, count(Songs.id) AS songs 
+           FROM Artists 
+            JOIN Albums ON Artists.id = Albums.artist_id 
+            JOIN Songs ON Songs.album_id = Albums.id
+           GROUP BY Artists.id"))
+```
+
+####6. Самый длинный альбом по числу песен. (имя исполнителя|название альбома|число)
+```{r c6}
+dbGetQuery(mydb, "SELECT Artists.name AS artist, Albums.name AS album, count(Songs.id) AS songs 
+           FROM Artists 
+            JOIN Albums ON Artists.id = Albums.artist_id 
+            JOIN Songs ON Songs.album_id = Albums.id
+           GROUP BY Albums.id
+           ORDER BY songs DESC
+           LIMIT 1")
+```
+
+####7. Самый длинный альбом по суммарной продолжительности. (имя исполнителя|название альбома|число)
+```{r c7}
+dbGetQuery(mydb, "SELECT Artists.name AS artist, Albums.name AS album, total(Songs.duration) AS duration 
+           FROM Albums 
+            JOIN Songs ON Songs.album_id = Albums.id 
+            JOIN Artists ON Artists.id = Albums.artist_id
+           GROUP BY Albums.id
+           ORDER BY duration DESC
+           LIMIT 1")
+```
+
+####8. Альбом самой большой средней продолжительностью трека. (имя исполнителя|название альбома|число)
+```{r c8}
+dbGetQuery(mydb, "SELECT Artists.name AS artist, Albums.name AS album, 
+           total(Songs.duration)/count(Songs.id) AS mean_duration 
+           FROM Albums 
+            JOIN Songs ON Songs.album_id = Albums.id 
+            JOIN Artists ON Artists.id = Albums.artist_id
+           GROUP BY Albums.id
+           ORDER BY duration DESC
+           LIMIT 1")
+```
+
+####9. Топ 5 самых прослушиваемых треков. (имя исполнителя|название альбома|название песни|число)
+```{r c9}
+dbGetQuery(mydb, "SELECT Artists.name as artist, Albums.name as album, Songs.name as song, count(Listened.user_id) as listenings 
+           FROM Albums 
+              JOIN Songs ON Songs.album_id = Albums.id 
+              JOIN Artists ON Artists.id = Albums.artist_id
+              JOIN Listened ON Songs.id = Listened.song_id
+           GROUP BY Songs.id
+           ORDER BY listenings DESC
+           LIMIT 5")
+```
+
+####10. Найдите год, что песни, выпущенные в этом году, слушают больше всего (год|количество прослушиваний)
+```{r c10}
+dbGetQuery(mydb, "SELECT Albums.release_year, count(Listened.user_id) AS listenings 
+           FROM Albums 
+              JOIN Songs ON Songs.album_id = Albums.id 
+              JOIN Listened ON Songs.id = Listened.song_id
+           GROUP BY Albums.release_year
+           ORDER BY listenings DESC
+           LIMIT 1")
+```
+
+####11. Для пользователя с id=47 найдите топ 20 последних прослушанных треков. (имя исполнителя|название альбома|название песни|когда)
+```{r c11}
+dbGetQuery(mydb, "SELECT Artists.name AS artist, Albums.name AS album, Songs.name AS song, Listened.start_time
+           FROM Users 
+              JOIN Listened ON Users.id = Listened.user_id
+              JOIN Songs ON Songs.id = Listened.song_id 
+              JOIN Albums ON Albums.id = Songs.album_id
+              JOIN Artists ON Artists.id = Albums.artist_id
+           WHERE Users.id = 47
+           ORDER BY start_time DESC
+           LIMIT 20")
+```
+
+####12. (Больше join Богу join) Для каждого пользователя и каждой песни, которую пользователь прослушал, найдите количество прослушиваний. (имя пользователя|имя исполнителя|название альбома|название песни|число) . Подсказка – можно использовать пару колонок в group by.
+```{r c12}
+head(dbGetQuery(mydb, "SELECT Users.username, Artists.name AS artist, Albums.name AS album, Songs.name AS song, count(Listened.song_id) AS listenings
+           FROM Users 
+              JOIN Listened ON Users.id = Listened.user_id
+              JOIN Songs ON Songs.id = Listened.song_id 
+              JOIN Albums ON Albums.id = Songs.album_id
+              JOIN Artists ON Artists.id = Albums.artist_id
+           GROUP BY Users.id, Songs.id
+           ORDER BY listenings DESC"))
+```
+```
+
+
+
+
+
+
+
+
+
+
+
+
