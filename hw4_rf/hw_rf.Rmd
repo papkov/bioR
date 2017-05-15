@@ -1,0 +1,286 @@
+---
+title: "Homework 4. Random forest"
+author: "Mike"
+date: '15 мая 2017 г '
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libs, message=FALSE, warning=FALSE}
+library(randomForest)
+library(rpart)
+library(rattle)
+library(rpart.plot)
+library(RColorBrewer)
+library(dplyr)
+library(ggplot2)
+
+set.seed(1408)
+```
+
+###Данные
+Данные возьмем из статьи “A novel strategy for forensic age prediction by DNA methylation and support vector regression model”, Cheng Xu et al, Scientific reports 2015. Авторы попытались построить предсказатель возраста человека по данным метилирования отдельных CpG sites.
+
+**ages.tsv** -- идентификаторы доноров: возраст, и название array, которым это всё добро сделали.
+
+**methylation.tsv** -- данные про CpG сайты: где эти сайты на геноме находятся, доля метилирования каждого сайта у наших доноров. Однако в этой табличке также есть NA-значения, авторы статьи утверждают, что это означает “no methylation detected”, и считают их за 0 
+```{r data, cache=T, warning=F}
+ages <- read.table("../data/ages.tsv", sep="\t", header=1)
+head(ages)
+
+methylation <- read.table("../data/methylation.tsv", sep="\t", header=1, row.names = 1, na.strings = "NA")
+methylation <- methylation %>% mutate_all(funs(replace(., is.na(.), 0)))
+print(methylation[1:5, 1:5])
+
+```
+
+###Предподготовка данных
+Вообще сайтов метилирования там какое-то не очень большое количество (95 сайтов), однако часть из них абсолютно не скоррелирована с возрастом, и наверняка вряд ли поможет нам в решении задачи регрессии. Хочется проделать примерно то же, что проделали авторы статьи – сделать ручками очень простой feature selection. Оставим только те, сайты метилирования, которые наиболее скоррелированы с возрастом.
+
+
+Для каждого сайта метилирования, посчитать корреляцию между долей метилирования этого сайта в доноре и возрасте донора.
+Для начала возьмем 10 сайтов с максимальной корреляцией и 10 с минимальной (отрицательной), хитро отсортируем их так, чтобы по центру были сайты с корреляцией, максимальной по модулю.
+
+```{r feature_selection_1, cache=T, warning=F}
+top_sites_neg <- apply(methylation, 1, function(x) c(site = x[3], cor_ = cor(as.numeric(x[4:length(x)]), ages$Age))) %>% 
+  t(.) %>%  data.frame(., stringsAsFactors = F) %>% mutate(cor_ = as.numeric(cor_)) %>%  top_n(., 10, -cor_)
+
+top_sites_pos <- apply(methylation, 1, function(x) c(site = x[3], cor_ = cor(as.numeric(x[4:length(x)]), ages$Age))) %>% 
+  t(.) %>%  data.frame(., stringsAsFactors = F) %>% mutate(cor_ = as.numeric(cor_)) %>%  top_n(., 10, cor_)
+
+
+top_sites <- rbind(arrange(top_sites_neg, desc(cor_)), arrange(top_sites_pos, desc(cor_)))
+print(top_sites)
+
+# Предикторы
+data <- 
+  rbind(filter(methylation, Position %in% top_sites_neg$site.Position) %>% arrange(desc(top_sites_neg$cor_)),
+        filter(methylation, Position %in% top_sites_pos$site.Position) %>% arrange(desc(top_sites_pos$cor_))) %>% 
+    select(-c(1:3)) %>% t() %>% 
+    data.frame()
+
+# Вектор ответов - возраст
+response <- ages$Age
+```
+
+###Рабочая функция
+Для анализа нам нужна будет функция-обертка, которая все сделает за нас: она принимает на вход data и response, в цикле по runs.number проводит кросс-валидацию для разных разбиений на тренировочную и тестовую выборки в соотношении 80/20, возвращает среднее по всем прогонам для тренировочной и тестовой выборок. 
+
+```{r wrapper}
+#' randomForest wrapper and error estimator
+#'
+#' @param data data.frame, dataset
+#' @param response numeric vector, values of dependent variables in dataset
+#' @param runs.number numeric (integer), how many times we should run random forest
+#' @param ... parameters that are passes to randomForest function, like
+#'        ntree, mtry, nodesize, replace, sampsize
+#'
+#' @return numeric vector with two values, 
+#'      first is mean of RMSE values on training data
+#'      second is mean of RMSE values on testing data
+#' @export
+#'
+#' @examples
+wrapper <- function(data, response,
+                    runs.number=20, ...) {
+  
+  
+  rmse <- sapply(seq(runs.number), function(x) {
+    
+    # Здесь будет кросс-валидация сразу, потому что иначе потом мы уткнемся в переобучение на конкретное разбиение
+    # Для усреднения будем брать 20 (по умолчанию) различных разбиений на тестовую и валидирующую, 
+    # соответственно, суммарно 100 запусков при соотношении 80:20
+    cross.validation <- matrix(sample(1:50, 50), nrow=5, ncol=10)
+    
+    cross.results <- apply(cross.validation, 1, function(test.sample){
+      # using each part as testing dataset
+      # using rest of the dataset as training dataset
+      train.sample <- (1:50)[-test.sample]
+      train.data <- data[train.sample, ]
+      train.response <- response[train.sample]
+      test.data <- data[test.sample, ]
+      test.response <- response[test.sample]
+      
+      # calculating RMSE for every part and default random forest
+      fit.rf <- randomForest(x = train.data, y = train.response, runs.number=runs.number, ...)
+      prediction_test <- predict(fit.rf, test.data)
+      prediction_train <- predict(fit.rf, train.data)
+      rmse_test <- sqrt(sum((prediction_test - test.response)^2)/length(prediction_test))
+      rmse_train <- sqrt(sum((prediction_train - train.response)^2)/length(prediction_train))
+      
+      return(c(rmse_train, rmse_test))
+      
+    })
+    
+    return(rowMeans(cross.results))
+    
+  })
+  
+  return(c(rmse.train = mean(rmse[1, ]), rmse.test = mean(rmse[2, ])))
+}
+```
+
+Посмотрим, что получилось: запустим классификатор по умолчанию и с одним деревом (так себе вариант)
+```{r wrapper_test}
+# Test: запуск randomForest с аргументами по умолчанию 20 раз и подсчет средней ошибки
+errors.defaults <- wrapper(data, response, 20)
+print(errors.defaults)
+
+# Test: запуск randomForest всего с 1 деревом внутри 20 раз и подсчет средней ошики
+errors.ntree1 <- wrapper(data, response, 20, ntree=1)
+print(errors.ntree1)
+```
+
+![Результат ожидаемый: на одном дереве далеко не уедешь.](./groot.jpg)
+
+###Feature selection
+Ранее мы отобрали 20 сайтов метилирования: 10 с положительной и 10 с отрицательной корреляцией. Теперь попробуем выяснить, какие сайты помогут лучше предсказать возраст и сколько их нужно (придется подождать). Для этого построим все возможные комбинации начал и концов массива фичей, посмотрим на ошибку для каждого набора.
+```{r feature_selection_2, cache=T, warning=F}
+s_e <- combn(1:20, 2)
+s_e_error <- apply(s_e, 2, function(x) wrapper(data[, c(x[1]:x[2])], response))
+
+border_error <- data.frame(borders = apply(s_e, 2, function(x) paste(x, collapse = "-")), t(s_e_error))
+border_error <- border_error[order(border_error$rmse.test), ]
+
+ggplot(border_error, aes(x = borders, group = 1))+
+  geom_line(aes(y = rmse.train, col = "train"))+
+  geom_hline(yintercept = min(border_error$rmse.train))+
+  geom_line(aes(y = rmse.test, col = "test"))+
+  geom_hline(yintercept = min(border_error$rmse.test))+
+  
+  ylab("RMSE")+
+  theme(axis.text.x = element_blank(), axis.title.x=element_blank())
+
+head(border_error)
+
+# Cохраним данные исходной статьи, чтобы посмотреть, насколько в итоге выйдет лучше
+original_data <- data[, c(1:10)]
+# Кажется, что диапазон 7-14 нам подходит, будем работать с ними
+data <- data[, c(7:14)]
+```
+
+#####PCA
+Посмотрим, насколько мы правы. Ожидаем, что мы выбрали необходимый и достаточный набор слабо скоррелированных предикторов
+```{r pca, cache=T, warning=F}
+pc <- prcomp(data, scale = T, center = T)
+barplot(summary(pc)$importance[2,]*100, ylab = "Persentage of variance", xlab = "Principal Components", main = "Variance explained by individual PC", col = "cyan3")
+sum(summary(pc)$importance[2,1:4]*100)
+```
+Вроде так и получилось: распределение вклада компонент позволяет предположить, что все верно.
+
+
+###Оптимизация обучения
+
+Параметры случайного леса
+Мы будем оптимизировать наш случайный лес по нескольким параметрам (эти параметры, являются аргументами функции randomForest). Напомню для сводки, что пускай NN – количество объектов в тренировочном датасете, MM – количество features в нашем датасете.
+
+* ntree – количество деревьев в случайном лесе, по умолчанию 500
+
+* replace – когда делается bagging (bootstrapping) нашего случайного леса, должны мы это делать с возвращением, или нет? По умолчанию, мы делает bagging с возвращением.
+
+* sampsize – когда делается bagging (bootstrapping) нашего случайного леса, сколько мы должны взять объектов из тренировочного датасета? По умолчанию, если replace==TRUE мы берем все NN объектов, а если FALSE, то 23N23N
+
+* nodesize – минимальный размер (по количеству объектов) для листовых вершин, значение по умолчанию – 5
+
+* mtry – количество признаков, которое случайно выбирается при каждом разбиении (это также называется feature bagging)
+
+Таким образом, если бы мы хотели, чтобы в нашем лесу, все деревья были переобучены, мы бы запустили это как-нибудь в духе:
+
+```{r overfit, cache=T, warning=F}
+# запуск randomForest со всеми вершинами (nodesize=1), replace=F, sampsize=N, mtry=M
+errors.overfit <- wrapper(data, response,
+                          nodesize=1, replace=F, sampsize=40, mtry=8, ntree=100)
+print(errors.overfit)
+```
+Далее по очереди подберем все параметры, фиксируя остальные.
+
+#####Количество деревьев (ntree)
+```{r ntree, cache=T, warning=F}
+n <- c(seq(1, 100, 5), seq(200, 2000, 100))
+rmse.ntree <- sapply(n, function(x) wrapper(data, response, ntree=x))
+
+ggplot(data.frame(n[-c(1)], t(rmse.ntree)[-c(1),]), aes(x = n[-c(1)]))+
+  geom_line(aes(y = rmse.train, col = "train"))+
+  geom_line(aes(y = rmse.test, col = "test"))+
+  ylab("RMSE")+
+  xlab("N tree")
+
+# Во имя скорости возьмем 200 деревьев, потому что разницы почти нет
+wrapper(data, response, ntree=200)
+```
+
+#####Размер выборки (sampsize) и перестановки (replace)
+```{r sampsize, cache=T, warning=F}
+ss <- c(1:40)
+
+rmse.sampsize_repT <- sapply(ss, function(x) wrapper(data, response, ntree = 200, mtry = 8, nodesize = 1, replace = T, sampsize=x))
+
+rmse.sampsize_repF <- sapply(ss, function(x) wrapper(data, response, ntree = 200, mtry = 8, nodesize = 1, replace = F, sampsize=x))
+
+to_plot <- rbind(data.frame(ss, data.frame(rep = F, t(rmse.sampsize_repF))), data.frame(ss, data.frame(rep = T, t(rmse.sampsize_repT))))
+
+ggplot(data.frame(ss, to_plot), aes(x = ss))+
+  facet_grid(. ~ rep)+
+  geom_line(aes(y = rmse.train, col = "train"))+
+  geom_line(aes(y = rmse.test, col = "test"))+
+  ylab("RMSE")+
+  xlab("Sample size")
+
+# Optimal
+wrapper(data, response, ntree = 200, replace = T, sampsize = 30)
+```
+
+Overfitting detected (см. левый график)! Используем `replace = T, sampsize = 30`
+
+#####Минимальный размер для листовых вершин (nodesize)
+```{r nodesize, cache=T, warning=F}
+nodes <- c(1:40)
+rmse.nodesize <- sapply(nodes, function(x) wrapper(data, response, ntree = 200, replace = T, sampsize = 30,  nodesize=x))
+
+ggplot(data.frame(nodes, t(rmse.nodesize)), aes(x = nodes))+
+  geom_line(aes(y = rmse.train, col = "train"))+
+  geom_line(aes(y = rmse.test, col = "test"))+
+  ylab("RMSE")+
+  xlab("Node size")
+
+# Optimal
+wrapper(data, response, ntree = 200, replace = T, sampsize = 30,  nodesize=1)
+```
+
+#####Количество признаков при случайном разбиении - feature bagging (mtry)
+```{r mtry, cache=T, warning=F}
+m <- c(1:8)
+rmse.mtry <- sapply(m, function(x) wrapper(data, response, ntree = 200, replace = T, sampsize = 30,  nodesize=1,  mtry=x))
+
+ggplot(data.frame(m, t(rmse.mtry)), aes(x = m))+
+  geom_line(aes(y = rmse.train, col = "train"))+
+  geom_line(aes(y = rmse.test, col = "test"))+
+  ylab("RMSE")+
+  xlab("mtry")
+
+# Optimal
+wrapper(data, response, ntree = 200, replace = T, sampsize = 30,  nodesize=1,  mtry=2)
+```
+
+
+#####Проверка
+Посмотрим, что мы настроили на большом числе runs.number
+```{r optimal, cache=T, warning=F}
+# Optimal
+wrapper(data, response, ntree = 200, replace = T, runs.number = 100, sampsize = 30,  nodesize=1,  mtry=2)
+# Non-optimal (???)
+wrapper(data, response, runs.number = 100)
+# Original data
+wrapper(original_data, response, runs.number = 100)
+```
+
+###Выводы
+Тюнинг себя почти не оправдал, можно использовать randomForest с настройками по умолчанию и не париться.
+Feature selection себя оправдал, используем в качестве фичей сайты:
+```{r sites, echo=F}
+print(top_sites[c(7:14), ])
+```
+
