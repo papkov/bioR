@@ -1,0 +1,248 @@
+---
+title: "Homework 5. CNN"
+author: "M. Papkov, I. Pavlov"
+date: '28 июня 2017 г '
+output: html_document:
+    toc: yes
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Данные
+Данные, которые легли в основу этой домашки взяты из статьи http://image.diku.dk/lauges/publications/Sorensen2010.pdf.
+Авторы данной статьи занимались квантификацией легочной эмфиземы, в связи с чем у этих ребят было некоторое количество изображений компьютерной томографии легких.
+
+Мы будем классифицировать кусочки изображений на три класса: normal tissue (NT), centrilobular emphysema (CLE), paraseptal emphysema (PSE).
+
+Картинки по которым будем производить классификацию находятся в папке `patches`. В папке `slices` лежат изорабражения срезов легких целиком. В файле `patch_labels.csv` лежит 168 чисел от 0 до 2: 0 for normal tissue (NT), 1 for centrilobular emphysema (CLE), 2 for paraseptal emphysema (PSE), описывает класс каждого изображения из папки patches. 
+
+Вообще все эти слайсы и патчи от реальных пациентов, и есть файлы, которые описывают это всё дело, но нас в этой работе будут интересовать только patches и patch_labels. Прочитаем их
+
+```{r read_data}
+patches <- dir("./patches", full.names = T)
+patch_labels <- read.csv("./patch_labels.csv", header = F)
+```
+
+### Библиотеки
+Для работы с изображениями будем использовать библиотеку OpenImageR.
+
+```{r libs, warning=FALSE, message=FALSE}
+library(OpenImageR)
+library(mxnet)
+```
+
+### Увеличение количества картинок
+В папке “patches” находятся `r length(patches)` jpg изображений размера 61x61. Этого количества, конечно, мало, поэтому было бы неплохо это количество увеличить. Как будем увеличивать? Картинку можно повернуть на какое-то количество градусов и зеркально отразить. Можно сдвинуть картинку на несколько пикселей. А ещё было бы неплохо применить ZCA whitening --– это такое нормализующее преобразование, которое часто используется в обучении нейронных сетей.
+
+#### Augmentation
+Первой частью задания будет искусственное увеличение датасета с помощью функции Augmentation в пакете OpenImageR: хочется взять и каждую картинку случайно повернуть и немного сдвинуть и проделать это где-то ~50 раз.
+
+Пример использования функции:
+```{r augmentation_example}
+
+# taken from https://stackoverflow.com/questions/22509106/converting-a-matrix-into-a-gray-scale-image-in-r
+grays <- rgb(red = 0:255/255, blue = 0:255/255, green = 0:255/255)
+
+# Source image
+patch <- readImage(patches[1])
+image(patch, col=grays)
+
+# ZCA only
+patchAugmented <- Augmentation(patch, zca_comps = 30, zca_epsilon = 0.1, threads = 1, verbose = F)
+image(patchAugmented, col=grays)
+
+# ZCA only + flip
+patchAugmented <- Augmentation(patch, flip_mode = "horizontal",
+                                 zca_comps = 30, zca_epsilon = 0.1, threads = 1, verbose = F)
+image(patchAugmented, col=grays)
+
+# ZCA only + flip + rotation 30 degrees counterclockwise
+patchAugmented <- Augmentation(patch, flip_mode = "horizontal", 
+             rotate_angle = 30, rotate_method = 'bilinear', 
+             zca_comps = 30, zca_epsilon = 0.1, threads = 1, verbose = F)
+image(patchAugmented, col=grays)
+
+# ZCA only + flip + rotation 30 degrees counterclockwise + shift 10 pixels comlumns and 5 pixels rows
+patchAugmented <- Augmentation(patch, flip_mode = "horizontal",
+             shift_cols = 10, shift_rows = 5,
+             rotate_angle = 30, rotate_method = 'bilinear', 
+             zca_comps = 30, zca_epsilon = 0.1, threads = 1, verbose = F, 
+             resiz_width = 40, resiz_height = 40, resiz_method = "bilinear")
+image(patchAugmented, col=grays)
+
+```
+
+
+Проведем аугментацию всех изображений, понизим размерность, сохраним результат на диск (это долго).
+
+```{r augmentation, cache=T, message=F, warning=F, eval=F}
+set.seed(88)
+
+dir.create("./patches_augmented_40/")
+
+s <- sapply(patches, function(p) {
+  print(p)
+  patch <- readImage(p)
+  degrees <- sample(seq(0, 360, 5), 50)
+  shift_r <- sample(seq(-7, 7, 1), 50, replace = T)
+  shift_c <- sample(seq(-7, 7, 1), 50, replace = T)
+  flip_m <- sample(c('horizontal', 'vertical'), 50, replace = T)
+  s <- sapply(1:50, function(x) {
+    patchAugmented <- Augmentation(patch, flip_mode = flip_m[x],
+                                   shift_cols = shift_c[x], shift_rows = shift_r[x],
+                                   rotate_angle = degrees[x], rotate_method = 'bilinear', 
+                                   zca_comps = 30, zca_epsilon = 0.1, threads = 1, verbose = F,
+                                   resiz_width = 40, resiz_height = 40, resiz_method = "bilinear")
+    
+    writeImage(patchAugmented,
+               file_name = paste0("./patches_augmented_40/", 
+                                  gsub("[.]jpg", "", strsplit(p, split = "/")[[1]][3]), 
+                                  "_augmented_", x, ".jpg"))
+    })
+})
+
+# Не забудем про лейблы
+patch_aug_labels <- as.data.frame(as.numeric(sapply(patch_labels[[1]], function(l) rep(l, 50))))
+```
+
+
+Создадим сет
+```{r create_set, cache=T}
+data.dims <- dim(patch_aug_labels)
+img.size <- 40
+features <- img.size * img.size
+
+dataset.size <- data.dims[1]
+nn.data.x <- matrix(0, nrow=dataset.size, ncol=features)
+nn.data.y <- patch_aug_labels[[1]]
+
+for (i in 1:168) {
+  for (j in 1:50) {
+    patch <- readImage(sprintf("./patches_augmented_40/patch%s_augmented_%s.jpg", i, j))
+    nn.data.x[(i-1)*50 + j, ] <- as.numeric(patch)
+  }
+}
+
+
+nn.data.x[1:12, 1:5]
+nn.data.y[1:12]
+```
+
+### Разделение датасета на тренирующую и валидирующую выборки
+
+```{r split}
+set.seed(1)
+
+dataset.size <- 168
+training.size <- floor(0.8 * dataset.size)
+validation.size <- dataset.size - training.size
+
+training.set <- sample(1:dataset.size, training.size)
+validation.set <- (1:dataset.size)[-training.set]
+
+training.set <- as.numeric(sapply(0:49, function(x) training.set + dataset.size * x))
+validation.set <- as.numeric(sapply(0:49, function(x) validation.set + dataset.size * x))
+
+train.x <- nn.data.x[training.set, ]
+train.y <- nn.data.y[training.set]
+test.x <- nn.data.x[validation.set, ]
+test.y <- nn.data.y[validation.set]
+
+dim(train.x)
+dim(test.x)
+
+data.frame(true.proportion = c((training.size / (168) * 100), ((1 - training.size / (168)) * 100)), type.1= c(sum(train.y == 1) / sum(nn.data.y == 1) * 100, sum(test.y == 1) / sum(nn.data.y == 1) * 100), type.2 = c(sum(train.y == 2) / sum(nn.data.y == 2) * 100, sum(test.y == 2) / sum(nn.data.y == 2) * 100), type.3 = c(sum(train.y == 3) / sum(nn.data.y == 3) * 100, sum(test.y == 3) / sum(nn.data.y == 3) * 100), row.names = c('train', 'test'))
+```
+
+### Обучение модели
+
+* eval.data содержит в себе валидирующие данные, такой запуск поможет нам сразу смотреть на ошибку train/test при обучении;
+
+* optimiser="adedelta" сходится чуть быстрее чем стохастический градиентный спуск; 
+
+* eval.metric нам нужен ’accuracy` ибо мы решаем задачу классификации;
+
+* epoch.end.callback – указывает, что нам бы показывать ошибку во время итераций.
+
+```{r}
+# В формат mxnet
+train.array <- t(train.x)
+dim(train.array) <- c(img.size, img.size, 1, ncol(train.array))
+test.array <- t(test.x)
+dim(test.array) <- c(img.size, img.size, 1, ncol(test.array))
+
+# Нормализуем так, чтобы было [-1; 1]
+train.array <- (train.array - 0.5) * 2
+test.array <- (test.array - 0.5) * 2
+
+mx.set.seed(1)
+
+# Это исходные данные
+data <- mx.symbol.Variable('data')
+# Это ядро, размер свертки - 5х5, 20 шаблонов
+# Сначала веса генерируются рандомно
+conv.1 <- mx.symbol.Convolution(data = data, kernel = c(5, 5), num_filter = 10)
+
+tanh.1 <- mx.symbol.Activation(data = conv.1, act_type = "tanh")
+# Пулинг: максимум от матрицы 2х2 с шагом 2, делаем картинки 10х10
+pool.1 <- mx.symbol.Pooling(data=tanh.1, kernel=c(4, 4), stride=c(2, 2), pool.type="max")
+
+conv.2 <- mx.symbol.Convolution(data = pool.1, kernel = c(5, 5), num_filter = 10)
+tanh.2 <- mx.symbol.Activation(data = conv.2, act_type = "tanh")
+pool.2 <- mx.symbol.Pooling(data=tanh.2, kernel=c(2, 2), stride=c(2, 2), pool.type="max")
+
+conv.3 <- mx.symbol.Convolution(data = pool.2, kernel = c(5, 5), num_filter = 10)
+tanh.3 <- mx.symbol.Activation(data = conv.3, act_type = "tanh")
+pool.3 <- mx.symbol.Pooling(data=tanh.3, kernel=c(2, 2), stride=c(2, 2), pool.type="max")
+
+# Полносвязный слой
+fc.1 <- mx.symbol.FullyConnected(data = pool.3, num_hidden = 4)
+nn.model <- mx.symbol.SoftmaxOutput(data = fc.1)
+
+graph.viz(nn.model)
+
+model <- mx.model.FeedForward.create(nn.model, 
+                                     X=train.array, 
+                                     y=as.array(train.y-1),
+                                     eval.data = list(
+                                       data=test.array,
+                                       label=as.array(test.y-1)
+                                     ),
+                                     ctx=mx.cpu(), 
+                                     num.round = 100,
+                                     optimizer="adadelta",
+                                     eval.metric = mx.metric.accuracy,
+                                     epoch.end.callback = mx.callback.log.train.metric(10))
+# Можно сохранить модель
+mx.model.save(model, "81-63", 1)
+
+# Можно доучить
+model2 <- mx.model.FeedForward.create(model$symbol, 
+                                      X=train.array,
+                                      y=as.array(train.y-1),
+                                      eval.data = list(
+                                       data=test.array,
+                                       label=as.array(test.y-1)
+                                       ),
+                                      ctx=mx.cpu(),
+                                      num.round = 50,
+                                      optimizer="adadelta",
+                                      # learning.rate=0.1, # метрика градиентного спуска
+                                      # momentum=0.9, # метрика градиентного спуска
+                                      eval.metric = mx.metric.accuracy,
+                                      epoch.end.callback = mx.callback.log.train.metric(10),
+                                      # epoch.end.callback=mx.callback.save.checkpoint("reload_chkpt"),
+                                      # batch.end.callback=mx.callback.log.train.metric(100),
+                                      arg.params=model$arg.params, aux.params=model$aux.params)
+```
+
+```{r test}
+pred <- predict(model2, test.array)
+pred <- apply(pred, 2, which.max)
+
+sum(pred == test.y)/length(pred)
+```
+
