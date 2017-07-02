@@ -1,10 +1,7 @@
 ---
 title: "Homework 5. CNN"
 author: "M. Papkov, I. Pavlov"
-date: '28 июня 2017 г '
-output: html_document:
-    toc: yes
-    toc_float: yes
+output: html_document
 ---
 
 ```{r setup, include=FALSE}
@@ -104,13 +101,14 @@ s <- sapply(patches, function(p) {
     })
 })
 
-# Не забудем про лейблы
-patch_aug_labels <- as.data.frame(as.numeric(sapply(patch_labels[[1]], function(l) rep(l, 50))))
 ```
 
 
 Создадим сет
 ```{r create_set, cache=T}
+# Не забудем про лейблы
+patch_aug_labels <- as.data.frame(as.numeric(sapply(patch_labels[[1]], function(l) rep(l, 50))))
+
 data.dims <- dim(patch_aug_labels)
 img.size <- 40
 features <- img.size * img.size
@@ -154,7 +152,19 @@ test.y <- nn.data.y[validation.set]
 dim(train.x)
 dim(test.x)
 
+# Посмотрим на разбиение
 data.frame(true.proportion = c((training.size / (168) * 100), ((1 - training.size / (168)) * 100)), type.1= c(sum(train.y == 1) / sum(nn.data.y == 1) * 100, sum(test.y == 1) / sum(nn.data.y == 1) * 100), type.2 = c(sum(train.y == 2) / sum(nn.data.y == 2) * 100, sum(test.y == 2) / sum(nn.data.y == 2) * 100), type.3 = c(sum(train.y == 3) / sum(nn.data.y == 3) * 100, sum(test.y == 3) / sum(nn.data.y == 3) * 100), row.names = c('train', 'test'))
+
+# Переведем формат mxnet
+train.array <- t(train.x)
+dim(train.array) <- c(img.size, img.size, 1, ncol(train.array))
+test.array <- t(test.x)
+dim(test.array) <- c(img.size, img.size, 1, ncol(test.array))
+
+# Нормализуем так, чтобы было [-1; 1]
+train.array <- (train.array - 0.5) * 2
+test.array <- (test.array - 0.5) * 2
+
 ```
 
 ### Обучение модели
@@ -167,17 +177,9 @@ data.frame(true.proportion = c((training.size / (168) * 100), ((1 - training.siz
 
 * epoch.end.callback – указывает, что нам бы показывать ошибку во время итераций.
 
-```{r}
-# В формат mxnet
-train.array <- t(train.x)
-dim(train.array) <- c(img.size, img.size, 1, ncol(train.array))
-test.array <- t(test.x)
-dim(test.array) <- c(img.size, img.size, 1, ncol(test.array))
+Образец:
 
-# Нормализуем так, чтобы было [-1; 1]
-train.array <- (train.array - 0.5) * 2
-test.array <- (test.array - 0.5) * 2
-
+```{r learn, cache=T, message=F, warning=F, eval=F}
 mx.set.seed(1)
 
 # Это исходные данные
@@ -199,11 +201,13 @@ tanh.3 <- mx.symbol.Activation(data = conv.3, act_type = "tanh")
 pool.3 <- mx.symbol.Pooling(data=tanh.3, kernel=c(2, 2), stride=c(2, 2), pool.type="max")
 
 # Полносвязный слой
-fc.1 <- mx.symbol.FullyConnected(data = pool.3, num_hidden = 4)
+fc.1 <- mx.symbol.FullyConnected(data = pool.3, num_hidden = 3)
 nn.model <- mx.symbol.SoftmaxOutput(data = fc.1)
 
+# Модель можно нарисовать
 graph.viz(nn.model)
 
+# И обучить
 model <- mx.model.FeedForward.create(nn.model, 
                                      X=train.array, 
                                      y=as.array(train.y-1),
@@ -217,7 +221,7 @@ model <- mx.model.FeedForward.create(nn.model,
                                      eval.metric = mx.metric.accuracy,
                                      epoch.end.callback = mx.callback.log.train.metric(10))
 # Можно сохранить модель
-mx.model.save(model, "81-63", 1)
+mx.model.save(model, "96-66", 1)
 
 # Можно доучить
 model2 <- mx.model.FeedForward.create(model$symbol, 
@@ -239,10 +243,26 @@ model2 <- mx.model.FeedForward.create(model$symbol,
                                       arg.params=model$arg.params, aux.params=model$aux.params)
 ```
 
-```{r test}
-pred <- predict(model2, test.array)
-pred <- apply(pred, 2, which.max)
+Обученные модели работают одинаково не очень:
+```{r models}
 
-sum(pred == test.y)/length(pred)
+models <- list(m1 = mx.model.load("75-65", 1),
+            m2 = mx.model.load("80-60", 1),
+            m3 = mx.model.load("81-63", 1),
+            m4 = mx.model.load("83-66", 1),
+            m5 = mx.model.load("96-66", 1))
+
+lapply(models, function(m) {
+  graph.viz(m$symbol)
+  
+  pred_train <- apply(predict(m, train.array), 2, which.max)
+  pred_test <- apply(predict(m, test.array), 2, which.max)
+
+  c(train = sum(pred_train == train.y)/length(pred_train), 
+    test = sum(pred_test == test.y)/length(pred_test))
+})
+
 ```
+
+Впрочем, ого, вторая заработала. Как это случилось, загадка. Возможно, она училась на другом сете, я, конечно, ничего не записал. That's all.
 
